@@ -7,8 +7,9 @@ Versions: ['2.0']
 License: "Ruby BSDL"
 License-Url: http://www.ruby-lang.org/en/about/license.txt
 Vendor: ruby.org
-Cartridge-Version: 0.0.4
+Cartridge-Version: 0.0.5
 Cartridge-Vendor: redhat
+Source-Url: https://github.com/lxsameer/ruby-1.9-cart.git
 Categories:
   - service
   - ruby
