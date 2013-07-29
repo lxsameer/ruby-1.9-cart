@@ -1,0 +1,204 @@
+#!/bin/bash -e
+
+source $OPENSHIFT_CARTRIDGE_SDK_BASH
+source "${OPENSHIFT_RUBY_DIR}/lib/util"
+source "${OPENSHIFT_RUBY_DIR}/lib/ruby_context"
+
+HTTPD_CFG_FILE=$OPENSHIFT_RUBY_DIR/etc/conf/httpd_nolog.conf
+HTTPD_PID_FILE=$OPENSHIFT_RUBY_DIR/run/httpd.pid
+
+function start() {
+    echo "Starting Ruby cart"
+    update_httpd_passenv $HTTPD_CFG_FILE
+    ensure_valid_httpd_process "$HTTPD_PID_FILE" "$HTTPD_CFG_FILE"
+    ruby_context "/usr/sbin/httpd -C 'Include $OPENSHIFT_RUBY_DIR/etc/conf.d/*.conf' -f $HTTPD_CFG_FILE -k start"
+}
+
+function stop() {
+    echo "Stopping Ruby cart"
+    ensure_valid_httpd_process "$HTTPD_PID_FILE" "$HTTPD_CFG_FILE"
+    if [ -f "$HTTPD_PID_FILE" ]; then
+        httpd_pid=`cat "$HTTPD_PID_FILE" 2> /dev/null`
+    fi
+    ruby_context "/usr/sbin/httpd -C 'Include $OPENSHIFT_RUBY_DIR/etc/conf.d/*.conf' -f $HTTPD_CFG_FILE -k stop"
+    wait_for_stop $httpd_pid
+}
+
+function restart() {
+    echo "${1}ing Ruby cart"
+    update_httpd_passenv $HTTPD_CFG_FILE
+    touch $OPENSHIFT_REPO_DIR/tmp/restart.txt
+    ruby_context "/usr/sbin/httpd -C 'Include $OPENSHIFT_RUBY_DIR/etc/conf.d/*.conf' -f $HTTPD_CFG_FILE -k restart"
+}
+
+function status() {
+   if output=$(curl http://$OPENSHIFT_RUBY_IP:$OPENSHIFT_RUBY_PORT/ &> /dev/null)
+   then
+      client_result "Application is running"
+   else
+      client_result "Application is either stopped or inaccessible"
+   fi
+}
+
+# Clean up any log files
+function tidy() {
+  client_message "Emptying log dir: $OPENSHIFT_RUBY_LOG_DIR"
+  shopt -s dotglob
+  rm -rf $OPENSHIFT_RUBY_LOG_DIR/*
+  rm -rf ${OPENSHIFT_RUBY_DIR}tmp/*
+}
+
+function pre-repo-archive() {
+  # set -x
+  rm -rf ${OPENSHIFT_RUBY_DIR}/tmp/.bundle ${OPENSHIFT_RUBY_DIR}/tmp/vendor
+
+  # If the previous and current commits didn't upload .bundle and you have .bundle and vendor/bundle already deployed then store away for redeploy
+  # Also adding .openshift/markers/force_clean_build at the root of the repo will trigger a clean rebundle
+  pushd "${OPENSHIFT_HOMEDIR}/git/${OPENSHIFT_APP_NAME}.git" 1>/dev/null
+    if ! git show master:.openshift/markers/force_clean_build > /dev/null 2>&1 \
+      && ! git show master:.bundle > /dev/null 2>&1                            \
+      && ! git show master~1:.bundle > /dev/null 2>&1                          \
+      && [ -d ${OPENSHIFT_REPO_DIR}.bundle ]                                   \
+      && [ -d ${OPENSHIFT_REPO_DIR}vendor/bundle ]
+    then
+      echo 'Saving away previously bundled RubyGems'
+      mv ${OPENSHIFT_REPO_DIR}.bundle ${OPENSHIFT_RUBY_DIR}/tmp/
+      mv ${OPENSHIFT_REPO_DIR}vendor ${OPENSHIFT_RUBY_DIR}/tmp/
+    fi
+  popd 1>/dev/null
+}
+
+function pre-build() {
+  # empty
+  true
+}
+
+function build() {
+    echo "Running build on Ruby cart"
+    update-configuration $OPENSHIFT_RUBY_VERSION
+
+    USED_BUNDLER=false
+    if [ -d $OPENSHIFT_RUBY_DIR/tmp/.bundle ]
+    then
+      USED_BUNDLER=true
+    fi
+
+    if $USED_BUNDLER
+    then
+      echo 'Restoring previously bundled RubyGems (note: you can commit .openshift/markers/force_clean_build at the root of your repo to force a clean bundle)'
+      mv $OPENSHIFT_RUBY_DIR/tmp/.bundle ${OPENSHIFT_REPO_DIR}
+      if [ -d ${OPENSHIFT_REPO_DIR}vendor ]
+      then
+        mv $OPENSHIFT_RUBY_DIR/tmp/vendor/bundle ${OPENSHIFT_REPO_DIR}vendor/
+      else
+        mv $OPENSHIFT_RUBY_DIR/tmp/vendor ${OPENSHIFT_REPO_DIR}
+      fi
+      rm -rf $OPENSHIFT_RUBY_DIR/tmp/.bundle $OPENSHIFT_RUBY_DIR/tmp/vendor
+    fi
+
+    # If .bundle isn't currently committed and a Gemfile is then bundle install
+    if [ -f ${OPENSHIFT_REPO_DIR}/Gemfile ]
+    then
+        pushd "${OPENSHIFT_HOMEDIR}/git/${OPENSHIFT_APP_NAME}.git" 1>/dev/null
+          if ! git show master:.bundle > /dev/null 2>&1
+          then
+              echo "Bundling RubyGems based on Gemfile/Gemfile.lock to repo/vendor/bundle with 'bundle install --deployment'"
+              pushd ${OPENSHIFT_REPO_DIR} 1> /dev/null
+                SAVED_GIT_DIR=$GIT_DIR
+                unset GIT_DIR
+                ruby_context "bundle install --deployment"
+                export GIT_DIR=$SAVED_GIT_DIR
+              popd 1> /dev/null
+          fi
+        popd 1>/dev/null
+    fi
+}
+
+function deploy() {
+  pushd ${OPENSHIFT_REPO_DIR} > /dev/null
+  if [ -f Gemfile ]
+  then
+    if [ -f Rakefile ] && bundle exec "rake -T" | grep "assets:precompile" >/dev/null
+    then
+      echo "Precompiling with 'bundle exec rake assets:precompile'"
+      ruby_context "bundle exec rake assets:precompile"
+    fi
+  fi
+  popd > /dev/null
+}
+
+function post-deploy() {
+  if hot_deploy_marker_is_present; then
+    echo "Hot deploy marker is present. Touching Passenger restart.txt to trigger redeployment."
+    touch ${OPENSHIFT_REPO_DIR}tmp/restart.txt
+  fi
+}
+
+function threaddump() {
+  # Handle scaled (non-head) gears
+  if [ "$OPENSHIFT_GEAR_UUID" != "$OPENSHIFT_APP_UUID" ]
+  then
+      if [ -t 0 ]
+      then
+          result=$(_threaddump $OPENSHIFT_GEAR_UUID)
+          if [ "$result" = "" ]; then
+              DATE=`date -u '+%Y%m%d'`
+              echo "The thread dump file will be available via: tail -f ${OPENSHIFT_RUBY_LOG_DIR}/error_log-$DATE-*"
+          else
+              echo " $result"
+          fi
+          echo ""
+      else
+          client_error "The rhc threaddump command is not supported on scaled gear: $OPENSHIFT_GEAR_UUID. ssh into the gear and issue ~/ruby/bin/control threaddump. "
+      fi
+      exit
+  fi
+
+  result=$(_threaddump $OPENSHIFT_GEAR_UUID)
+
+  if [ "$result" = "" ]; then
+      DATE=`date -u '+%Y%m%d'`
+      client_result "Success"
+      client_result ""
+      # note bz 923405/921537 for why log file name is not more specific
+      client_result "The thread dump file will be available via: rhc tail ${OPENSHIFT_APP_NAME} -f ${OPENSHIFT_RUBY_LOG_DIR}/error_log-$DATE-* -o '-n 250'"
+  else
+      client_result " $result"
+  fi
+
+}
+
+function _threaddump() {
+
+  if [ $# -ne 1 ]
+  then
+      echo "Usage: $0 UUID"
+      exit 1
+  fi
+
+  PID=$(ps -u $(id -u $1) -o pid,command | grep -v grep | grep 'Rack:.*'$1 | awk 'BEGIN {FS=" "}{print $1}')
+
+  if [ -z "$PID" ]; then
+    echo "Unable to detect application PID. Check the application's availability by accessing http://${OPENSHIFT_GEAR_DNS}"
+  else
+    if ! kill -s ABRT $PID; then
+      echo "Failed to signal application. Please retry after restarting application and access it by its URL (http://${OPENSHIFT_GEAR_DNS})"
+    fi
+  fi
+}
+
+case "$1" in
+  start)             start ;;
+  stop)              stop ;;
+  restart | reload ) restart $1 ;;
+  status)            status ;;
+  tidy)              tidy ;;
+  pre-repo-archive)  pre-repo-archive ;;
+  pre-build)         pre-build ;;
+  build)             build ;;
+  deploy)            deploy ;;
+  post-deploy)       post-deploy ;;
+  threaddump)        threaddump ;;
+  update-configuration)   update-configuration $OPENSHIFT_RUBY_VERSION;;
+  *)                 exit 0
+esac
